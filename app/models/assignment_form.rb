@@ -1,5 +1,5 @@
-
 require 'active_support/time_with_zone'
+require 'fileutils'
 
 class AssignmentForm
   attr_accessor :assignment, :assignment_questionnaires, :due_dates, :tag_prompt_deployments
@@ -309,16 +309,54 @@ class AssignmentForm
     MailWorker.perform_in(find_min_from_now(Time.parse(due_date.due_at.to_s(:db)) + simicheck_delay.to_i.hours).minutes.from_now * 60, @assignment.id, "compare_files_with_simicheck", due_date.due_at.to_s(:db))
   end
 
+  def self.copy_calibration(old_assign,new_assign_id)
+    if old_assign.is_calibrated
+      SubmissionRecord.copycalibratedsubmissions(old_assign, new_assign_id)
+      old_team_ids = Team.createnewteam(old_assign, new_assign_id)
+      @new_teams = Team.where(parent_id: new_assign_id)
+      new_team_ids = []
+      @new_teams.each do |catt|
+        new_team_ids.append(catt.id)
+      end
+      dict = Hash[old_team_ids.zip new_team_ids]
+      count = 0
+      old_team_ids.each do |catt|
+        @old_team_user = TeamsUser.where(team_id: catt)
+        @old_team_user.each do |matt|
+          @new_team_user = TeamsUser.new
+          @new_team_user.team_id = new_team_ids[count]
+          @new_team_user.user_id = matt.user_id
+          @new_team_user.save
+          Participant.createparticipant(matt, old_assign, new_assign_id)
+        end
+        Participant.mapreviewresponseparticipant(old_assign, new_assign_id, dict)
+        ReviewResponseMap.newreviewresp(old_assign, catt, dict, new_assign_id)
+        count += 1
+      end
+      old_directory_path = ""
+      new_directory_path = ""
+      old_team_ids.each do |catt|
+        @team_needed = Team.where(id:catt).first
+        @team_inserted = Team.where(id:dict[catt]).first
+        old_directory_path = @team_needed.directory_path
+        new_directory_path = @team_inserted.directory_path
+        break
+      end
+    end
+    if File.exist?(old_directory_path)
+      Dir.mkdir(new_directory_path) unless File.exist?(new_directory_path)
+      FileUtils.cp_r old_directory_path+'/.', new_directory_path
+    end
+  end
+
   # Copies the inputted assignment into new one and returns the new assignment id
   def self.copy(assignment_id, user)
     Assignment.record_timestamps = false
     old_assign = Assignment.find(assignment_id)
     new_assign = old_assign.dup
     user.set_instructor(new_assign)
-
     # Set name of new assignment as 'Copy of <old assignment name>'. If it already exists, set it as 'Copy of <old assignment name> (1)'.
     # Repeated till unique name is found.
-
     name_counter = 0
     new_name = 'Copy of ' + new_assign.name
     until Assignment.find_by(name: new_name).nil?
@@ -326,7 +364,6 @@ class AssignmentForm
       name_counter += 1
       new_name += ' (' + name_counter.to_s + ')'
     end
-
     new_assign.update_attribute('name', new_name)
     new_assign.update_attribute('created_at', Time.now)
     new_assign.update_attribute('updated_at', Time.now)
@@ -346,9 +383,10 @@ class AssignmentForm
     else
       new_assign_id = nil
     end
+    copy_calibration(old_assign,new_assign_id)
     new_assign_id
   end
-
+  
   def self.copy_assignment_questionnaire(old_assign, new_assign, user)
     old_assign.assignment_questionnaires.each do |aq|
       AssignmentQuestionnaire.create(
